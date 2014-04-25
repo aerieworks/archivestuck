@@ -1,0 +1,474 @@
+#!/usr/bin/python
+
+from bs4 import BeautifulSoup, Comment
+from argparse import ArgumentParser
+from random import uniform
+from sys import argv, stderr, stdout
+from time import sleep
+from traceback import format_exc
+from urllib2 import urlopen
+from urlparse import urlparse, urlunparse
+from os import makedirs, path
+import json
+import re
+
+ORIGINALS_ROOT = 'originals'
+PAGE_DATA_ROOT = 'page_data'
+COMIC_CONTENT_START = re.compile(r"""<!--\s*begin\s+comic\s+content\s*-->""", re.IGNORECASE | re.MULTILINE)
+COMIC_CONTENT_END = re.compile(r"""<!--\s*end\s+comic\s+content\s*-->""", re.IGNORECASE | re.MULTILINE)
+COMIC_ONE_START = re.compile(r"""<!--\s*COMIC\s+ONE\s*-->""", re.IGNORECASE | re.MULTILINE)
+TABLE_START = '<table '
+TABLE_END = '</table>'
+COMIC_TWO_START = re.compile(r"""<!--\s*COMIC\s+TWO\s*-->""", re.IGNORECASE | re.MULTILINE)
+COMIC_ONE_TWO_END = re.compile(r"""<!--\s*END\s+COMIC\s+ONE\s+TWO\s*-->""", re.IGNORECASE | re.MULTILINE)
+COMIC_RESOURCE_SRC = re.compile(r"""\s*http://www.mspaintadventures.com/storyfiles/\s*""", re.IGNORECASE | re.MULTILINE)
+STORY_FILE_PREFIX = '/storyfiles/'
+COMIC_LOG_BUTTON_TEXT_PREFIX = 'Show '
+CHAT_ACTOR = re.compile(r"""^[a-z]+[A-Z][a-z]+ \[[A-Z]{2}\]$""")
+
+def log(message, newline=True):
+  stderr.write(message)
+  if newline:
+    stderr.write('\n')
+  else:
+    stderr.flush()
+
+
+def load_file_contents(file_path):
+  f = open(file_path, 'r')
+  content = f.read()
+  f.close()
+  return content
+
+
+def write_file_contents(file_path, mode, contents):
+  directories = path.dirname(file_path)
+  if len(directories) > 0 and not path.exists(directories):
+    log('Making dirs: {}'.format(directories))
+    makedirs(directories)
+  f = open(file_path, mode)
+  f.write(contents)
+  f.close()
+
+
+def fetch_resource(url, root_dir, file_name=None):
+  delay = uniform(1, 2)
+  log('Delaying {:1.3f} seconds...'.format(delay), newline=False)
+  sleep(delay)
+  log('done.')
+
+  url_path = urlparse(url).path.lstrip('/')
+  file_path = path.join(root_dir, url_path)
+  if file_name != None:
+    file_path = path.join(path.dirname(file_path), file_name)
+
+  log('Fetching resource: {}'.format(url))
+  resource = urlopen(url)
+  content = resource.read()
+  log('Saving resource to: {}'.format(file_path))
+  write_file_contents(file_path, 'wb', content)
+  log('Resource saved.')
+  return content
+
+
+def get_page_file_name(page_number):
+  return '{}.html'.format(page_number)
+
+
+def fetch_page(page_number):
+  log('Fetching HTML for page {}...'.format(page_number))
+  try:
+    content = fetch_resource('http://www.mspaintadventures.com/?s=6&p=' + page_number, ORIGINALS_ROOT, file_name=get_page_file_name(page_number))
+    log('done.')
+    return content
+  except:
+    log('error.')
+    raise
+
+
+def extract_multiple_comics(markup, start_index):
+  comics = []
+  # Find the end of the first comic by finding the start of the second and working backwards to the first comic's closing TABLE tag.
+  end_index = -1
+  end_match = COMIC_TWO_START.search(markup, start_index)
+  if end_match:
+    end_index = markup.rfind(TABLE_END, start_index, end_match.start())
+  if end_index == -1:
+    raise Exception('Unable to find end of COMIC ONE in multi-comic page.')
+  end_index += len(TABLE_END)
+  comics.append(markup[start_index:end_index])
+
+
+  # Find the start of the second comic's TABLE tag, first one after the "COMIC TWO" comment.
+  start_index = markup.find(TABLE_START, end_match.end())
+  if start_index == -1:
+    raise Exception('Unable to find start of COMIC TWO in multi-comic page.')
+  # Now find end of comic two by finding the end of both comics and skipping back to end of two's table.
+  end_index = -1
+  end_match = COMIC_ONE_TWO_END.search(markup, start_index)
+  if end_match:
+    end_index = markup.rfind(TABLE_END, start_index, end_match.start())
+    if end_index > -1:
+      # First closing TABLE tag is for a table that was opened before COMIC ONE.  Need to find the next earliest closing TABLE tag.
+      end_index = markup.rfind(TABLE_END, start_index, end_index)
+  if end_index == -1:
+    raise Exception('Unable to find end of COMIC TWO in multi-comic page.')
+  end_index += len(TABLE_END)
+  comics.append(markup[start_index:end_index])
+  return comics
+
+
+def extract_single_comic(markup, start_index):
+  end_index = None
+  end_match = COMIC_CONTENT_END.search(markup, start_index)
+  if end_match:
+    end_index = end_match.end()
+  return markup[start_index:end_index]
+
+
+def extract_comic_content(markup):
+  start_match = COMIC_ONE_START.search(markup)
+  if start_match:
+    # Multi-comic page.  Start of first comic is right after the "COMIC ONE" comment.
+    return extract_multiple_comics(markup, start_match.end())
+
+  start_match = COMIC_CONTENT_START.search(markup)
+  if start_match:
+    return [ extract_single_comic(markup, start_match.start()) ]
+  else:
+    log('No normal comic content found; trying Doc Scratch interlude pattern.')
+    tables = BeautifulSoup(markup).find_all('table', limit=3)
+    if len(tables) != 3:
+      raise Exception('Still couldn\'t find comic content.')
+    return [ str(tables[2]) ]
+
+
+  return None
+
+
+def find_comic_resources(soup):
+  log('Identifying comic resources...', newline=False)
+  comic_resources = []
+  for resource in soup.find_all(attrs={ 'src': COMIC_RESOURCE_SRC }):
+    src = resource.attrs['src'].strip()
+    src_url = urlparse(src)
+    src_path = urlunparse((None, None, src_url.path, None, src_url.query, None))
+    comic_resources.append({ 'src': src, 'path': src_path })
+
+  log('{} resources found.'.format(len(comic_resources)))
+  return comic_resources
+
+
+def safe_strip(string):
+  if string:
+    return string.strip()
+  return string
+
+
+def get_element_info(element):
+  return {
+    'style': safe_strip(element.attrs['style']),
+    'text': safe_strip(element.text)
+  }
+
+
+def parse_log_text(parts):
+  speaker, text = parts[0]['value'].split(':', 1)
+  parts[0]['value'] = text.lstrip()
+
+  return {
+    'event_type': 'text',
+    'actor': {
+      'style': parts[0]['style'],
+      'tag': speaker
+    },
+    'content': parts
+  }
+
+
+def parse_log_chat_action(parts):
+  event = {
+    'event_type': 'chat_action',
+    'actor': {
+      # "-- tentacleTherapist "
+      'name': parts[0]['value'].strip('- '),
+      'style': parts[1]['style'],
+      # "[TT]"
+      'tag': parts[1]['value'].lstrip('[').rstrip(']')
+    }
+  }
+
+  count = len(parts)
+  if count == 3:
+    # " is now an idle chum! --"
+    event['action'] = parts[2]['value'].rstrip(' \t\n-')
+  elif count == 5:
+    # " changed his mood to RANCOROUS  <img src="..." border="0" />  --"
+    event['action'] = parts[2]['value'].strip()
+    event['attachment'] = parts[3]['value']
+  else:
+    event['target'] = {}
+    # " began pestering grimAuxiliatrix "
+    action, target_name = parts[2]['value'].strip().rsplit(' ', 1)
+    event['action'] = action.strip()
+    event['target'] = {
+      'name': target_name.strip(),
+      'style': parts[3]['style'],
+      # "[GA]"
+      'tag': parts[3]['value'].lstrip('[').rstrip(']')
+    }
+
+    if count == 5:
+      text_parts = parts[4]['value'].strip().split(' ')
+      if text_parts[0] == 'at':
+        # " at 16:13 --"
+        event['when'] = text_parts[1]
+      else:
+        # " the file "..." --"
+        event['attachment'] = text_parts[-2]
+
+  return event
+
+
+def parse_chat_actor_2(part):
+  actor_parts = part['value'].split()
+  return {
+    'name': actor_parts[0],
+    'tag': actor_parts[1].lstrip('[').rstrip(']'),
+    'style': part['style']
+  }
+
+def parse_log_chat_action_2(parts):
+  event = {
+    'event_type': 'chat_action',
+    'action': parts[1]['value'],
+    'actor': parse_chat_actor_2(parts[0]),
+    'target': parse_chat_actor_2(parts[2])
+  }
+  if len(parts) == 4:
+    event['when'] = parts[3]['value']
+  return event
+
+def parse_log_memo_action(parts):
+  event = { 'event_type': 'memo_action' }
+
+  actor_parts = parts[0]['value'].strip().split(' ')
+  if len(actor_parts) == 1:
+    # "CCG"
+    event['actor'] = { 'tag': actor_parts[0] }
+    if len(parts) == 2:
+      # " banned himself from responding to this memo."
+      event['action'] = parts[1]['value'].strip().split(' ')[0]
+    else:
+      # " banned <span style="color: #005682">CAG</span> from responding to this memo."
+      event['action'] = parts[1]['value'].strip()
+      event['target'] = {
+        'style': parts[2]['style'],
+        'tag': parts[2]['value']
+      }
+  else:
+    # "CURRENT carcinoGeneticist [CGC]"
+    event['actor'] = {
+      'modifier': actor_parts[0],
+      'name': actor_parts[1],
+      'tag': actor_parts[2].strip('[]')
+    }
+    # " 3:14 HOURS FROM NOW responded to this memo."
+    event['action'] = parts[1]['value'].strip()
+
+  event['actor']['style'] = parts[0]['style']
+
+  return event
+
+
+def parse_log_narration(part):
+  return {
+    'actor': '<narration>',
+    'style': part['style'],
+    'value': part['value']
+  }
+
+
+def parse_log_event(parts):
+  try:
+    if isinstance(parts[0], basestring):
+      raise Exception('Log event part is just a string? "{}"'.format(parts[0]))
+    first_value = parts[0]['value']
+    if first_value.startswith('-- '):
+      return parse_log_chat_action(parts)
+    elif first_value.find(':') > -1:
+      return parse_log_text(parts)
+    elif CHAT_ACTOR.search(first_value):
+      return parse_log_chat_action_2(parts)
+    elif len(parts) == 1:
+      if isinstance(parts[0], dict):
+        return parse_log_narration(parts[0])
+      else:
+        return parse_log_narration({ 'style': parts[0].attrs['style'], 'value': parts[0].text })
+    else:
+      return parse_log_memo_action(parts)
+  except:
+    log(str(parts))
+    raise
+
+
+def get_comic_log(button, log_container):
+  log = {
+    'events': []
+  }
+
+  if not button:
+    log['log_type'] = None
+  elif not button.text.startswith(COMIC_LOG_BUTTON_TEXT_PREFIX):
+    raise Exception('Unrecognized log button text: "{}".'.format(button.text))
+  else:
+    log['log_type'] = button.text[len(COMIC_LOG_BUTTON_TEXT_PREFIX):]
+
+  log_event_parts = []
+  for element in log_container.children:
+    if isinstance(element, basestring):
+      text = element
+      if text.strip() == '~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~':
+        continue
+      if len(log_event_parts) == 0:
+        # If this is the first part of the log event, trim leading whitespace (newlines and indentation).
+        text = text.lstrip()
+      if text != '' and text != '\n':
+        # If after trimming whitespace we still have non-newline text content, add it to the event.
+        log_event_parts.append({ 'value': text, 'style': None })
+    elif element.name.lower() == 'a':
+      # There are a few log entries that are links.
+      event = parse_log_event(element.contents)
+      event['link'] = element.attrs['href']
+      log['events'].append(event)
+    elif element.name.lower() == 'img':
+      # There's like one of these. XD
+      log_event_parts.append({ 'value': element.attrs['src'], 'style': None })
+    elif element.name.lower() == 'span':
+      if len(element.contents) != 1 or not isinstance(element.contents[0], basestring):
+        text = str(element)
+      else:
+        text = element.text
+      if len(log_event_parts) == 0:
+        # If this is the first part of the log event, trim leading whitespace (newlines and indentation).
+        text = text.lstrip()
+      log_event_parts.append({ 'value': text, 'style': element.attrs['style'] })
+    elif element.name.lower() == 'br':
+      # Line breaks (<br/>) signal the end of one event in the log and the start of the next.
+      if len(log_event_parts) > 0:
+        # If we have parts of a log event in the queue, parse them and clear the queue.
+        log['events'].append(parse_log_event(log_event_parts))
+        log_event_parts = []
+    else:
+      raise Exception('Unrecognized tag type in comic log: {}'.format(element.name))
+
+  # If we got to the end of the log and still have queued log event parts, parse them.
+  if len(log_event_parts) > 0:
+    log['events'].append(parse_log_event(log_event_parts))
+
+
+  for log_item in log['events']:
+    if not log_item['actor']:
+      raise Exception('Log event missing actor: "{}"'.format(json.dumps(log_item)))
+
+  return log
+
+
+def get_comic_next(soup):
+  elements = soup.find_all('font', text='', limit=2)
+  if len(elements) == 2 and len(elements[1].contents) > 0 and elements[1].contents[0] == '> ':
+    link = elements[1].find('a')
+    return {
+      'href': safe_strip(link.attrs['href']),
+      'text': safe_strip(link.text)
+    }
+  return None
+
+
+def get_comic_data(comic_content):
+  soup = BeautifulSoup(comic_content)
+
+  log('Identifying text content.')
+  elements = soup.find_all('p', limit=3)
+  if len(elements) < 2:
+    raise Exception('Page command, description, and/or log not found.')
+
+  comic_data = {
+    'command': get_element_info(elements[0]),
+    'description': get_element_info(elements[1]),
+    'resources': find_comic_resources(soup),
+    'next': get_comic_next(soup),
+    'log': None
+  }
+
+  if len(elements) == 3:
+    comic_data['log'] = get_comic_log(elements[1].next_sibling.find('button'), elements[2])
+
+  return comic_data
+
+
+def parse_page(page_number, content=None):
+  log('Parsing page {}...'.format(page_number))
+  if content == None:
+    log('Loading original page from cached copy.')
+    content = load_file_contents(path.join(ORIGINALS_ROOT, get_page_file_name(page_number)))
+
+  log('Extracting comic content.')
+  comics = extract_comic_content(content)
+  if not comics:
+    raise Exception('No comic content found.')
+
+  page_data = {
+    'page_number': page_number,
+    'comics': []
+  }
+
+  index = 0
+  for comic in comics:
+    index += 1
+    log('Processing comic #{}...'.format(index))
+
+    soup = BeautifulSoup(comic, 'html5lib')
+    page_data['comics'].append(get_comic_data(comic))
+
+    log('done.')
+
+  page_data_content = json.dumps(page_data, indent=2, separators=(',', ': ')) + '\n'
+  page_data_file_path = path.join(PAGE_DATA_ROOT, '{}.json'.format(page_number))
+  log('Saving page data to {}...'.format(page_data_file_path), newline=False)
+  write_file_contents(page_data_file_path, 'w', page_data_content)
+  log('done.')
+
+  return page_data
+
+
+arg_parser = ArgumentParser()
+arg_parser.add_argument('-s', '--start', type=int, required=True, help='The page number to start from.')
+arg_parser.add_argument('-e', '--end', type=int, help='The page number to end at.  If unspecified, will operate on one page and exit.')
+arg_parser.add_argument('-f', '--fetch', action='store_true', help='Fetch the markup for each page.')
+arg_parser.add_argument('-p', '--parse', action='store_true', help='Parse the markup into archive data.')
+args = arg_parser.parse_args()
+
+if args.end == None:
+  args.end = args.start
+
+try:
+  for i in xrange(args.start, args.end + 1):
+    log('-----')
+    if i % 100 == 0:
+      stdout.write('{}.'.format(i))
+      stdout.flush()
+    page_number = str(i).zfill(6)
+    try:
+      page_content = None
+      if args.fetch:
+        page_content = fetch_page(page_number)
+      if args.parse:
+        parse_page(page_number, content=page_content)
+    except KeyboardInterrupt:
+      log('Received KeyboardInterrupt, exiting.')
+      exit(1)
+    except:
+      log(format_exc())
+finally:
+  stdout.write('\n')
